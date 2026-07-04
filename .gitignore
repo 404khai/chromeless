@@ -1,5 +1,6 @@
 Chromeless.app/
 Chromeless.icns
 build/
+dist/
 *.provisionprofile
 .DS_Store

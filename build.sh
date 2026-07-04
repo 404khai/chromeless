@@ -4,7 +4,8 @@ set -euo pipefail
 cd "${0:a:h}"
 
 APP="Chromeless.app"
-ARCH="$(uname -m)"
+ARCH="${ARCH:-$(uname -m)}"
+VERSION="$(tr -d '[:space:]' < VERSION)"
 
 if [[ ! -f Chromeless.icns ]]; then
   echo "▸ rendering icon"
@@ -23,7 +24,7 @@ swiftc -O -swift-version 5 \
   -framework Cocoa -framework WebKit
 
 cp Chromeless.icns "$APP/Contents/Resources/Chromeless.icns"
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -33,8 +34,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>Chromeless</string>
   <key>CFBundleIdentifier</key><string>com.chromeless.app</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+  <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>CFBundleIconFile</key><string>Chromeless</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>

@@ -6,6 +6,24 @@ A native macOS app in one Swift file, built on WKWebView (the Safari engine). No
 
 ![chromeless start page](docs/chromeless.png)
 
+## Install
+
+**Homebrew** (recommended once [v1.0.0](https://github.com/antiwork/chromeless/releases/tag/v1.0.0) is published):
+
+```sh
+brew install --cask antiwork/chromeless/chromeless
+```
+
+Or install directly from this repo before the first release:
+
+```sh
+brew install --cask ./Casks/chromeless.rb
+```
+
+**GitHub Releases** — download `Chromeless-vX.Y.Z-macos-arm64.zip` or `-x86_64.zip`, unzip, and move `Chromeless.app` to `/Applications/`.
+
+**Build from source** — see below.
+
 ## Build
 
 ```sh
@@ -14,6 +32,18 @@ open Chromeless.app
 ```
 
 Requires the Xcode Command Line Tools (`xcode-select --install`). Optionally `mv Chromeless.app /Applications/`.
+
+### Release (maintainers)
+
+```sh
+git tag v1.0.0 && git push origin v1.0.0   # triggers Release workflow
+./scripts/package-release.sh arm64         # build a release zip locally
+./scripts/package-release.sh x86_64
+./scripts/update-cask-sha256.sh            # refresh Casks/chromeless.rb checksums
+./tests/validate-cask.sh                   # verify cask syntax
+```
+
+Version is read from `VERSION` at build time.
 
 ## Use
 
