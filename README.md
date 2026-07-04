@@ -46,6 +46,17 @@ Chromeless doubles as a webpage-to-PNG tool:
 
 It loads the page, waits for it to settle, writes a Retina PNG, and exits.
 
+## Tests
+
+Snapshot regression tests run on every push and pull request via GitHub Actions (`macos-latest`):
+
+```sh
+./tests/run-snap-tests.sh   # build + CLI snapshot tests locally
+./tests/update-golden.sh    # refresh golden sha256 after intentional rendering changes
+```
+
+Tests assert exit codes, PNG dimensions (1x or 2x Retina), a golden sha256 for a static fixture, and that a delayed chart fixture produces a larger PNG when given more settle time.
+
 ## Notes
 
 - Cookies and logins persist (kept in `~/Library/WebKit/com.chromeless.app/`), so YouTube stays signed in.
