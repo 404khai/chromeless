@@ -44,7 +44,20 @@ Chromeless doubles as a webpage-to-PNG tool:
 ./Chromeless.app/Contents/MacOS/Chromeless localhost:3000 --snap dev.png --wait 3
 ```
 
-It loads the page, waits for it to settle, writes a Retina PNG, and exits.
+By default it loads the page, waits a fixed interval (`--wait`, default 1 s), writes a Retina PNG, and exits. For pages that keep loading after navigation finishes — charts, dashboards, SPAs — use `--wait-for` to snap only when the page is actually ready:
+
+```sh
+# Wait for document + images/stylesheets
+./Chromeless.app/Contents/MacOS/Chromeless dashboard.com --snap out.png --wait-for load
+
+# Wait until fetch/XHR has been quiet for 500 ms
+./Chromeless.app/Contents/MacOS/Chromeless api.app --snap out.png --wait-for network-idle --wait 0
+
+# Wait until a specific element appears (e.g. chart finished rendering)
+./Chromeless.app/Contents/MacOS/Chromeless dashboard.com --snap chart.png --wait-for selector:.chart-ready
+```
+
+`--wait` still adds extra seconds *after* the `--wait-for` condition is met (use `--wait 0` to skip). `--wait-for` times out after 30 s.
 
 ## Notes
 

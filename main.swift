@@ -53,7 +53,18 @@ func smartURL(_ input: String) -> URL? {
 
 // MARK: - Launch options
 
-struct SnapJob { let path: String; let wait: TimeInterval }
+enum SnapSettleMode: Equatable {
+    case sleep
+    case load
+    case networkIdle
+    case selector(String)
+}
+
+struct SnapJob {
+    let path: String
+    let wait: TimeInterval
+    let settle: SnapSettleMode
+}
 
 struct LaunchOptions {
     var url: URL? = nil
@@ -61,10 +72,24 @@ struct LaunchOptions {
     var size: NSSize? = nil
 }
 
+func parseSettleMode(_ value: String) -> SnapSettleMode? {
+    switch value {
+    case "load": return .load
+    case "network-idle": return .networkIdle
+    default:
+        if value.hasPrefix("selector:") {
+            let sel = String(value.dropFirst("selector:".count))
+            if !sel.isEmpty { return .selector(sel) }
+        }
+        return nil
+    }
+}
+
 func parseLaunchOptions() -> LaunchOptions {
     var opts = LaunchOptions()
     var snapPath: String? = nil
     var wait: TimeInterval = 1.0
+    var settle: SnapSettleMode = .sleep
     let args = Array(CommandLine.arguments.dropFirst())
     var i = 0
     while i < args.count {
@@ -75,13 +100,19 @@ func parseLaunchOptions() -> LaunchOptions {
             chromeless — the browser that isn't there
 
             usage: chromeless [url] [options]
-              --snap <path>     load the page, save a PNG of it, and quit
-              --size <WxH>      window size in points (e.g. 1440x900)
-              --wait <seconds>  extra settle time before --snap (default 1.0)
+              --snap <path>       load the page, save a PNG of it, and quit
+              --size <WxH>        window size in points (e.g. 1440x900)
+              --wait <seconds>    extra settle time before --snap (default 1.0)
+              --wait-for <mode>   wait for page readiness before --snap:
+                                    load           document + subresources loaded
+                                    network-idle   no fetch/XHR activity for 500ms
+                                    selector:CSS   element matching CSS selector exists
 
             examples:
               chromeless youtube.com
               chromeless localhost:3000 --snap shot.png --size 1280x800
+              chromeless dashboard.com --snap chart.png --wait-for selector:.chart-ready
+              chromeless api.app --snap out.png --wait-for network-idle --wait 0
             """)
             exit(0)
         case "--snap":
@@ -96,6 +127,14 @@ func parseLaunchOptions() -> LaunchOptions {
         case "--wait":
             i += 1
             if i < args.count { wait = Double(args[i]) ?? 1.0 }
+        case "--wait-for":
+            i += 1
+            if i < args.count, let mode = parseSettleMode(args[i]) {
+                settle = mode
+            } else {
+                fputs("chromeless: --wait-for requires load, network-idle, or selector:CSS\n", stderr)
+                exit(1)
+            }
         default:
             if a.hasPrefix("-") {
                 fputs("chromeless: ignoring unknown option \(a)\n", stderr)
@@ -107,10 +146,47 @@ func parseLaunchOptions() -> LaunchOptions {
     }
     if let p = snapPath {
         let abs = p.hasPrefix("/") ? p : FileManager.default.currentDirectoryPath + "/" + p
-        opts.snap = SnapJob(path: abs, wait: wait)
+        opts.snap = SnapJob(path: abs, wait: wait, settle: settle)
     }
     return opts
 }
+
+// Injected at document start when --wait-for network-idle is used.
+let networkIdleTrackerScript = """
+(function () {
+  if (window.__chromelessNetworkIdle) return;
+  var pending = 0, quietSince = 0, QUIET_MS = 500;
+  function bump() { pending++; quietSince = 0; }
+  function drop() {
+    pending = Math.max(0, pending - 1);
+    if (pending === 0) quietSince = Date.now();
+  }
+  var origFetch = window.fetch;
+  if (origFetch) {
+    window.fetch = function () {
+      bump();
+      return origFetch.apply(this, arguments).finally(drop);
+    };
+  }
+  var XO = XMLHttpRequest.prototype.open, XS = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function () {
+    this.__chromelessTrack = true;
+    return XO.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function () {
+    if (this.__chromelessTrack) {
+      bump();
+      this.addEventListener('loadend', drop, { once: true });
+    }
+    return XS.apply(this, arguments);
+  };
+  window.__chromelessNetworkIdle = function () {
+    if (pending > 0) return false;
+    if (!quietSince) { quietSince = Date.now(); return false; }
+    return Date.now() - quietSince >= QUIET_MS;
+  };
+})();
+"""
 
 let launchOptions = parseLaunchOptions()
 
@@ -235,6 +311,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: false)
             conf.userContentController.addUserScript(hideWebAuthn)
+        }
+        if snap?.settle == .networkIdle {
+            conf.userContentController.addUserScript(WKUserScript(
+                source: networkIdleTrackerScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false))
         }
         webView = BrowserWebView(frame: .zero, configuration: conf)
         snapJob = snap
@@ -519,17 +601,77 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     }
 
     private func runSnapJob(_ job: SnapJob) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + job.wait) { [weak self] in
-            guard let self else { exit(3) }
-            self.webView.takeSnapshot(with: nil) { image, error in
-                guard let image, let dims = self.writePNG(from: image, to: job.path) else {
-                    fputs("chromeless: snapshot failed: \(error?.localizedDescription ?? "could not write PNG")\n", stderr)
-                    exit(3)
+        switch job.settle {
+        case .sleep:
+            DispatchQueue.main.asyncAfter(deadline: .now() + job.wait) { [weak self] in
+                self?.takeSnap(job)
+            }
+        case .load, .networkIdle, .selector:
+            waitForSettle(job.settle, timeout: 30) { [weak self] settled in
+                guard let self else { exit(3) }
+                if !settled {
+                    fputs("chromeless: --wait-for timed out after 30s\n", stderr)
+                    exit(4)
                 }
-                print("saved \(job.path) (\(dims.0)x\(dims.1) px)")
-                exit(0)
+                DispatchQueue.main.asyncAfter(deadline: .now() + job.wait) { [weak self] in
+                    self?.takeSnap(job)
+                }
             }
         }
+    }
+
+    private func takeSnap(_ job: SnapJob) {
+        webView.takeSnapshot(with: nil) { image, error in
+            guard let image, let dims = self.writePNG(from: image, to: job.path) else {
+                fputs("chromeless: snapshot failed: \(error?.localizedDescription ?? "could not write PNG")\n", stderr)
+                exit(3)
+            }
+            print("saved \(job.path) (\(dims.0)x\(dims.1) px)")
+            exit(0)
+        }
+    }
+
+    private func waitForSettle(_ mode: SnapSettleMode, timeout: TimeInterval,
+                               completion: @escaping (Bool) -> Void) {
+        let deadline = Date().addingTimeInterval(timeout)
+        func poll() {
+            guard Date() < deadline else { completion(false); return }
+            settleCheckJS(mode) { ready in
+                if ready { completion(true) }
+                else { DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { poll() } }
+            }
+        }
+        poll()
+    }
+
+    private func settleCheckJS(_ mode: SnapSettleMode, completion: @escaping (Bool) -> Void) {
+        let js: String
+        switch mode {
+        case .load:
+            js = "document.readyState === 'complete'"
+        case .networkIdle:
+            js = "window.__chromelessNetworkIdle ? window.__chromelessNetworkIdle() : true"
+        case .selector(let sel):
+            js = """
+            (function (sel) {
+              try { return document.querySelector(sel) !== null; }
+              catch (e) { return false; }
+            })(\(jsStringLiteral(sel)))
+            """
+        case .sleep:
+            completion(true)
+            return
+        }
+        webView.evaluateJavaScript(js) { result, _ in
+            completion((result as? Bool) == true)
+        }
+    }
+
+    private func jsStringLiteral(_ s: String) -> String {
+        let escaped = s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+        return "\"\(escaped)\""
     }
 
     // MARK: Menu actions
@@ -728,7 +870,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         if launchOptions.snap != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+            let snapTimeout: TimeInterval = {
+                guard let snap = launchOptions.snap else { return 30 }
+                switch snap.settle {
+                case .sleep: return snap.wait + 15
+                default: return 30 + snap.wait + 5
+                }
+            }()
+            DispatchQueue.main.asyncAfter(deadline: .now() + snapTimeout) {
                 fputs("chromeless: --snap timed out\n", stderr)
                 exit(2)
             }
