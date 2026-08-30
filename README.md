@@ -24,7 +24,8 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⌘L` | Search or enter a URL (floating HUD) |
 | `⌘drag` | Move the window from anywhere |
 | `⌃⌘F` | Fullscreen (YouTube's own ⛶ button works too) |
-| `⇧⌘S` | Snapshot the page as PNG → Desktop |
+| `⇧⌘S` | Snapshot the visible viewport as PNG → Desktop |
+| `⌥⇧⌘S` | Snapshot the full vertical page as PNG → Desktop |
 | `⌘P` | Pin the window above everything |
 | `⌘[` / `⌘]` | Back / forward (two-finger swipe also works) |
 | `Esc` | Bail out — back to the start page (`⌘[` returns) |
@@ -42,9 +43,12 @@ Chromeless doubles as a webpage-to-PNG tool:
 ```sh
 ./Chromeless.app/Contents/MacOS/Chromeless https://example.com --snap shot.png --size 1440x900
 ./Chromeless.app/Contents/MacOS/Chromeless localhost:3000 --snap dev.png --wait 3
+./Chromeless.app/Contents/MacOS/Chromeless example.com --snap full.png --full-page
 ```
 
-It loads the page, waits for it to settle, writes a Retina PNG, and exits.
+It loads the page, waits for it to settle, writes a Retina PNG, and exits. Add
+`--full-page` to stitch the page's complete vertical content at the requested
+viewport width instead of capturing only the visible viewport.
 
 ## Notes
 

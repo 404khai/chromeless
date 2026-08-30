@@ -4,13 +4,14 @@
 // address bar — just the page, in a bare rounded window. Built on WKWebView
 // (the Safari engine). Made for clean screenshots and fullscreen video.
 //
-//   ⌘L  search / open url        ⇧⌘S  snapshot page → Desktop
+//   ⌘L  search / open url        ⇧⌘S  snapshot viewport → Desktop
+//                              ⌥⇧⌘S  snapshot full page → Desktop
 //   ⌘R  reload                   ⌘P   pin window on top
 //   ⌘[ ⌘]  back / forward        ⌃⌘F  fullscreen
 //   ⌘= ⌘- ⌘0  zoom               ⌘drag  move the window
 //
 // CLI screenshot mode:
-//   chromeless https://example.com --snap out.png --size 1440x900 --wait 2
+//   chromeless https://example.com --snap out.png --full-page --size 1440x900 --wait 2
 
 import Cocoa
 import Security
@@ -53,12 +54,17 @@ func smartURL(_ input: String) -> URL? {
 
 // MARK: - Launch options
 
-struct SnapJob { let path: String; let wait: TimeInterval }
+struct SnapJob {
+    let path: String
+    let wait: TimeInterval
+    let fullPage: Bool
+}
 
 struct LaunchOptions {
     var url: URL? = nil
     var snap: SnapJob? = nil
     var size: NSSize? = nil
+    var fullPage = false
 }
 
 func parseLaunchOptions() -> LaunchOptions {
@@ -76,17 +82,20 @@ func parseLaunchOptions() -> LaunchOptions {
 
             usage: chromeless [url] [options]
               --snap <path>     load the page, save a PNG of it, and quit
+              --full-page      capture the full vertical page with --snap
               --size <WxH>      window size in points (e.g. 1440x900)
               --wait <seconds>  extra settle time before --snap (default 1.0)
 
             examples:
               chromeless youtube.com
-              chromeless localhost:3000 --snap shot.png --size 1280x800
+              chromeless localhost:3000 --snap shot.png --full-page --size 1280x800
             """)
             exit(0)
         case "--snap":
             i += 1
             if i < args.count { snapPath = args[i] }
+        case "--full-page":
+            opts.fullPage = true
         case "--size":
             i += 1
             if i < args.count {
@@ -107,7 +116,7 @@ func parseLaunchOptions() -> LaunchOptions {
     }
     if let p = snapPath {
         let abs = p.hasPrefix("/") ? p : FileManager.default.currentDirectoryPath + "/" + p
-        opts.snap = SnapJob(path: abs, wait: wait)
+        opts.snap = SnapJob(path: abs, wait: wait, fullPage: opts.fullPage)
     }
     return opts
 }
@@ -143,7 +152,8 @@ let startPageHTML = """
     <div class="k"><kbd>&#8984; L</kbd></div>       <div>search or enter a url</div>
     <div class="k"><kbd>&#8984; drag</kbd></div>    <div>move the window</div>
     <div class="k"><kbd>&#8963;&#8984; F</kbd></div><div>fullscreen</div>
-    <div class="k"><kbd>&#8679;&#8984; S</kbd></div><div>snapshot the page &rarr; desktop</div>
+    <div class="k"><kbd>&#8679;&#8984; S</kbd></div><div>snapshot the viewport &rarr; desktop</div>
+    <div class="k"><kbd>&#8997;&#8679;&#8984; S</kbd></div><div>snapshot the full page &rarr; desktop</div>
     <div class="k"><kbd>&#8984; P</kbd></div>       <div>pin on top of every window</div>
     <div class="k"><kbd>&#8984; [</kbd> <kbd>&#8984; ]</kbd></div><div>back / forward</div>
     <div class="k"><kbd>esc</kbd></div>             <div>bail out &mdash; back to this page</div>
@@ -195,6 +205,26 @@ final class LayoutReportingView: NSView {
     }
 }
 
+enum SnapshotCaptureError: LocalizedError {
+    case alreadyInProgress
+    case invalidPageMetrics
+    case imageTooLarge(Int, Int)
+    case couldNotCreateImage
+
+    var errorDescription: String? {
+        switch self {
+        case .alreadyInProgress:
+            return "another snapshot is already in progress"
+        case .invalidPageMetrics:
+            return "could not measure the page"
+        case let .imageTooLarge(width, height):
+            return "page is too large to capture safely (\(width)x\(height) px)"
+        case .couldNotCreateImage:
+            return "could not create the snapshot image"
+        }
+    }
+}
+
 // MARK: - Browser window
 
 final class BrowserWindowController: NSWindowController, NSWindowDelegate,
@@ -212,6 +242,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private var toastHide: DispatchWorkItem?
     private var lastProgress: CGFloat = 0
     private var onStartPage = false
+    private var snapshotInProgress = false
     var onClose: (() -> Void)?
 
     init(url: URL?, size: NSSize?, snap: SnapJob?, isPrimary: Bool) {
@@ -518,10 +549,191 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
     }
 
+    private func takePageSnapshot(fullPage: Bool,
+                                  completion: @escaping (NSImage?, Error?) -> Void) {
+        guard !snapshotInProgress else {
+            completion(nil, SnapshotCaptureError.alreadyInProgress)
+            return
+        }
+        snapshotInProgress = true
+
+        var didFinish = false
+        let finish: (NSImage?, Error?) -> Void = { [weak self] image, error in
+            guard !didFinish else { return }
+            didFinish = true
+            self?.snapshotInProgress = false
+            completion(image, error)
+        }
+
+        guard fullPage else {
+            webView.takeSnapshot(with: nil) { image, error in finish(image, error) }
+            return
+        }
+
+        // WKSnapshotConfiguration only supports rectangles inside the visible
+        // view bounds. Capture successive viewports instead, then stitch them
+        // without resizing the web view (which would change responsive layouts).
+        let metricsScript = """
+        (() => {
+          const root = document.documentElement;
+          const body = document.body;
+          const values = [
+            root ? root.scrollHeight : 0, root ? root.offsetHeight : 0,
+            root ? root.clientHeight : 0, body ? body.scrollHeight : 0,
+            body ? body.offsetHeight : 0, body ? body.clientHeight : 0,
+            window.innerHeight
+          ];
+          return {
+            height: Math.max(...values),
+            viewportHeight: window.innerHeight,
+            scrollX: window.scrollX,
+            scrollY: window.scrollY,
+            rootSnap: root ? root.style.scrollSnapType : "",
+            bodySnap: body ? body.style.scrollSnapType : ""
+          };
+        })()
+        """
+
+        webView.evaluateJavaScript(metricsScript) { [weak self] value, error in
+            guard let self else { return }
+            guard error == nil,
+                  let metrics = value as? [String: Any],
+                  let pageHeight = (metrics["height"] as? NSNumber)?.doubleValue,
+                  let viewportHeight = (metrics["viewportHeight"] as? NSNumber)?.doubleValue,
+                  let originalX = (metrics["scrollX"] as? NSNumber)?.doubleValue,
+                  let originalY = (metrics["scrollY"] as? NSNumber)?.doubleValue,
+                  pageHeight.isFinite, viewportHeight.isFinite,
+                  pageHeight > 0, viewportHeight > 0
+            else {
+                finish(nil, error ?? SnapshotCaptureError.invalidPageMetrics)
+                return
+            }
+
+            let rootSnap = metrics["rootSnap"] as? String ?? ""
+            let bodySnap = metrics["bodySnap"] as? String ?? ""
+            let restoreValues = [rootSnap, bodySnap]
+            let restoreJSON = (try? JSONSerialization.data(withJSONObject: restoreValues))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "[\"\",\"\"]"
+
+            // Scroll snapping can otherwise move a requested tile and leave gaps.
+            self.webView.evaluateJavaScript("""
+            (() => {
+              if (document.documentElement) document.documentElement.style.scrollSnapType = "none";
+              if (document.body) document.body.style.scrollSnapType = "none";
+            })()
+            """)
+
+            var bitmapContext: CGContext?
+            var pixelWidth = 0
+            var pixelHeight = 0
+            var pixelsPerCSSPoint = 0.0
+            let maximumPixelCount = 100_000_000
+            let maximumScrollY = max(0, pageHeight - viewportHeight)
+
+            func restorePageAndFinish(_ image: NSImage?, _ captureError: Error?) {
+                self.webView.evaluateJavaScript("""
+                (() => {
+                  const saved = \(restoreJSON);
+                  if (document.documentElement) document.documentElement.style.scrollSnapType = saved[0];
+                  if (document.body) document.body.style.scrollSnapType = saved[1];
+                  window.scrollTo({left: \(originalX), top: \(originalY), behavior: "instant"});
+                })()
+                """) { _, _ in
+                    finish(image, captureError)
+                }
+            }
+
+            func captureTile(at requestedY: Double) {
+                self.webView.evaluateJavaScript("""
+                (() => {
+                  window.scrollTo({left: \(originalX), top: \(requestedY), behavior: "instant"});
+                  return window.scrollY;
+                })()
+                """) { value, scrollError in
+                    guard scrollError == nil, let actualY = (value as? NSNumber)?.doubleValue else {
+                        restorePageAndFinish(nil, scrollError ?? SnapshotCaptureError.invalidPageMetrics)
+                        return
+                    }
+
+                    // Give sticky elements, images, and compositor layers a frame
+                    // to settle at their new scroll position before capture.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        self.webView.takeSnapshot(with: nil) { image, snapshotError in
+                            guard let image,
+                                  let tile = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+                            else {
+                                restorePageAndFinish(nil,
+                                    snapshotError ?? SnapshotCaptureError.couldNotCreateImage)
+                                return
+                            }
+
+                            if bitmapContext == nil {
+                                pixelWidth = tile.width
+                                pixelsPerCSSPoint = Double(tile.height) / viewportHeight
+                                pixelHeight = Int(ceil(pageHeight * pixelsPerCSSPoint))
+                                guard pixelWidth > 0, pixelHeight > 0,
+                                      pixelWidth <= maximumPixelCount / pixelHeight,
+                                      let context = CGContext(
+                                        data: nil,
+                                        width: pixelWidth,
+                                        height: pixelHeight,
+                                        bitsPerComponent: 8,
+                                        bytesPerRow: pixelWidth * 4,
+                                        space: CGColorSpace(name: CGColorSpace.sRGB)
+                                            ?? CGColorSpaceCreateDeviceRGB(),
+                                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                                else {
+                                    restorePageAndFinish(nil,
+                                        SnapshotCaptureError.imageTooLarge(pixelWidth, pixelHeight))
+                                    return
+                                }
+                                bitmapContext = context
+                            }
+
+                            guard let context = bitmapContext else {
+                                restorePageAndFinish(nil, SnapshotCaptureError.couldNotCreateImage)
+                                return
+                            }
+                            let top = Int(round(actualY * pixelsPerCSSPoint))
+                            let destination = CGRect(
+                                x: 0,
+                                y: pixelHeight - top - tile.height,
+                                width: tile.width,
+                                height: tile.height)
+                            context.draw(tile, in: destination)
+
+                            if actualY >= maximumScrollY - 0.5 {
+                                guard let result = context.makeImage() else {
+                                    restorePageAndFinish(nil,
+                                        SnapshotCaptureError.couldNotCreateImage)
+                                    return
+                                }
+                                let finalImage = NSImage(
+                                    cgImage: result,
+                                    size: NSSize(width: result.width, height: result.height))
+                                restorePageAndFinish(finalImage, nil)
+                                return
+                            }
+
+                            let nextY = min(actualY + viewportHeight, maximumScrollY)
+                            guard nextY > actualY + 0.5 else {
+                                restorePageAndFinish(nil, SnapshotCaptureError.invalidPageMetrics)
+                                return
+                            }
+                            captureTile(at: nextY)
+                        }
+                    }
+                }
+            }
+
+            captureTile(at: 0)
+        }
+    }
+
     private func runSnapJob(_ job: SnapJob) {
         DispatchQueue.main.asyncAfter(deadline: .now() + job.wait) { [weak self] in
             guard let self else { exit(3) }
-            self.webView.takeSnapshot(with: nil) { image, error in
+            self.takePageSnapshot(fullPage: job.fullPage) { image, error in
                 guard let image, let dims = self.writePNG(from: image, to: job.path) else {
                     fputs("chromeless: snapshot failed: \(error?.localizedDescription ?? "could not write PNG")\n", stderr)
                     exit(3)
@@ -552,17 +764,26 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     @objc func resetZoom(_ sender: Any?) { webView.pageZoom = 1.0 }
 
     @objc func saveSnapshot(_ sender: Any?) {
+        saveSnapshotToDesktop(fullPage: false)
+    }
+
+    @objc func saveFullPageSnapshot(_ sender: Any?) {
+        saveSnapshotToDesktop(fullPage: true)
+    }
+
+    private func saveSnapshotToDesktop(fullPage: Bool) {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
         let name = "chromeless \(formatter.string(from: Date())).png"
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
         let path = desktop.appendingPathComponent(name).path
-        webView.takeSnapshot(with: nil) { [weak self] image, _ in
+        if fullPage { showToast("Capturing full page…") }
+        takePageSnapshot(fullPage: fullPage) { [weak self] image, error in
             guard let self else { return }
             if let image, self.writePNG(from: image, to: path) != nil {
                 self.showToast("Saved “\(name)” to Desktop")
             } else {
-                self.showToast("Snapshot failed")
+                self.showToast(error?.localizedDescription ?? "Snapshot failed")
             }
         }
     }
@@ -589,6 +810,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         case #selector(goForwardAction(_:)): return webView.canGoForward
         case #selector(copyPageURL(_:)):
             return webView.url != nil && webView.url?.absoluteString != "about:blank"
+        case #selector(saveSnapshot(_:)), #selector(saveFullPageSnapshot(_:)):
+            return !snapshotInProgress
         case #selector(togglePin(_:)):
             menuItem.state = window?.level == .floating ? .on : .off
             return true
@@ -781,6 +1004,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let snap = fileMenu.addItem(withTitle: "Save Snapshot to Desktop",
                                     action: #selector(BrowserWindowController.saveSnapshot(_:)), keyEquivalent: "s")
         snap.keyEquivalentModifierMask = [.command, .shift]
+        let fullPageSnap = fileMenu.addItem(withTitle: "Save Full Page Snapshot to Desktop",
+                                            action: #selector(BrowserWindowController.saveFullPageSnapshot(_:)),
+                                            keyEquivalent: "s")
+        fullPageSnap.keyEquivalentModifierMask = [.command, .option, .shift]
         fileMenu.addItem(.separator())
         fileMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         main.addItem(withTitle: "File", action: nil, keyEquivalent: "").submenu = fileMenu
