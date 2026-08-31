@@ -48,7 +48,9 @@ Chromeless doubles as a webpage-to-PNG tool:
 
 It loads the page, waits for it to settle, writes a Retina PNG, and exits. Add
 `--full-page` to stitch the page's complete vertical content at the requested
-viewport width instead of capturing only the visible viewport.
+viewport width instead of capturing only the visible viewport. Flutter Web
+pages are supported even when their scrolling is managed inside Flutter's
+rendered scene rather than by the browser document.
 
 ## Notes
 

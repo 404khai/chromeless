@@ -205,6 +205,15 @@ final class LayoutReportingView: NSView {
     }
 }
 
+struct ManagedPageScrollInfo {
+    let elementID: String
+    let viewportHeight: Double
+    let contentTop: Double
+    let contentHeight: Double
+    let maximumScroll: Double
+    let originalScroll: Double
+}
+
 enum SnapshotCaptureError: LocalizedError {
     case alreadyInProgress
     case invalidPageMetrics
@@ -588,6 +597,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             viewportHeight: window.innerHeight,
             scrollX: window.scrollX,
             scrollY: window.scrollY,
+            flutterView: !!document.querySelector("flutter-view"),
             rootSnap: root ? root.style.scrollSnapType : "",
             bodySnap: body ? body.style.scrollSnapType : ""
           };
@@ -606,6 +616,28 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
                   pageHeight > 0, viewportHeight > 0
             else {
                 finish(nil, error ?? SnapshotCaptureError.invalidPageMetrics)
+                return
+            }
+
+            // Flutter Web keeps the browser document fixed at one viewport and
+            // scrolls inside its rendered scene. Enabling Flutter's semantics
+            // exposes that internal scrollable with real dimensions, allowing
+            // it to be captured without guessing from canvas pixels.
+            if metrics["flutterView"] as? Bool == true,
+               pageHeight <= viewportHeight + 1 {
+                self.prepareFlutterScrollCapture { info, prepareError in
+                    if let prepareError {
+                        finish(nil, prepareError)
+                    } else if let info {
+                        self.takeManagedFullPageSnapshot(info, completion: finish)
+                    } else {
+                        // A Flutter view with no overflowing semantics scroller
+                        // genuinely fits in one viewport.
+                        self.webView.takeSnapshot(with: nil) { image, error in
+                            finish(image, error)
+                        }
+                    }
+                }
                 return
             }
 
@@ -728,6 +760,257 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
             captureTile(at: 0)
         }
+    }
+
+    private func prepareFlutterScrollCapture(
+        completion: @escaping (ManagedPageScrollInfo?, Error?) -> Void
+    ) {
+        let enableSemanticsScript = """
+        (() => {
+          if (!document.querySelector("flutter-view")) return false;
+          const ready = [...document.querySelectorAll("flt-semantics")]
+            .some(el => el.scrollHeight > el.clientHeight + 1);
+          if (!ready) document.querySelector("flt-semantics-placeholder")?.click();
+          return true;
+        })()
+        """
+
+        webView.evaluateJavaScript(enableSemanticsScript) { [weak self] value, error in
+            guard let self else { return }
+            guard error == nil, value as? Bool == true else {
+                completion(nil, error ?? SnapshotCaptureError.invalidPageMetrics)
+                return
+            }
+
+            let findScrollerScript = """
+            (() => {
+              const candidates = [...document.querySelectorAll("flt-semantics")]
+                .map(el => {
+                  const rect = el.getBoundingClientRect();
+                  return {
+                    el,
+                    rect,
+                    range: el.scrollHeight - el.clientHeight,
+                    overflow: getComputedStyle(el).overflowY
+                  };
+                })
+                .filter(item => item.range > 1 && item.rect.width > 0 &&
+                  (item.overflow === "auto" || item.overflow === "scroll"))
+                .sort((a, b) => b.range - a.range);
+              const item = candidates[0];
+              if (!item) return null;
+              if (!item.el.id) item.el.id = "chromeless-managed-scroll";
+              let style = document.getElementById("chromeless-snapshot-scrollbars");
+              if (!style) {
+                style = document.createElement("style");
+                style.id = "chromeless-snapshot-scrollbars";
+                style.textContent = `
+                  flt-semantics::-webkit-scrollbar {
+                    display: none !important;
+                    width: 0 !important;
+                    height: 0 !important;
+                  }
+                `;
+                document.head.appendChild(style);
+              }
+              return {
+                id: item.el.id,
+                viewportHeight: window.innerHeight,
+                contentTop: Math.max(0, item.rect.top),
+                contentHeight: item.el.clientHeight,
+                maximumScroll: item.range,
+                originalScroll: item.el.scrollTop
+              };
+            })()
+            """
+
+            func pollForScroller(_ attempt: Int) {
+                self.webView.evaluateJavaScript(findScrollerScript) { value, error in
+                    if let error {
+                        completion(nil, error)
+                        return
+                    }
+                    if let values = value as? [String: Any],
+                       let id = values["id"] as? String,
+                       let viewportHeight = (values["viewportHeight"] as? NSNumber)?.doubleValue,
+                       let contentTop = (values["contentTop"] as? NSNumber)?.doubleValue,
+                       let contentHeight = (values["contentHeight"] as? NSNumber)?.doubleValue,
+                       let maximumScroll = (values["maximumScroll"] as? NSNumber)?.doubleValue,
+                       let originalScroll = (values["originalScroll"] as? NSNumber)?.doubleValue,
+                       viewportHeight > 0, contentHeight > 0, maximumScroll > 0 {
+                        completion(ManagedPageScrollInfo(
+                            elementID: id,
+                            viewportHeight: viewportHeight,
+                            contentTop: contentTop,
+                            contentHeight: contentHeight,
+                            maximumScroll: maximumScroll,
+                            originalScroll: originalScroll), nil)
+                        return
+                    }
+                    guard attempt < 20 else {
+                        completion(nil, nil)
+                        return
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        pollForScroller(attempt + 1)
+                    }
+                }
+            }
+
+            pollForScroller(0)
+        }
+    }
+
+    private func takeManagedFullPageSnapshot(
+        _ info: ManagedPageScrollInfo,
+        completion: @escaping (NSImage?, Error?) -> Void
+    ) {
+        let encodedID = (try? JSONEncoder().encode(info.elementID))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
+        let maximumPixelCount = 100_000_000
+        let bottomFixedTop = min(info.viewportHeight, info.contentTop + info.contentHeight)
+        let bottomFixedHeight = max(0, info.viewportHeight - bottomFixedTop)
+        let pageHeight = info.viewportHeight + info.maximumScroll
+        var bitmapContext: CGContext?
+        var pixelHeight = 0
+        var pixelsPerCSSPoint = 0.0
+
+        func setScroll(_ requested: Double, then action: @escaping (Double, Error?) -> Void) {
+            webView.evaluateJavaScript("""
+            (() => {
+              const el = document.getElementById(\(encodedID));
+              if (!el) return null;
+              el.scrollTop = \(requested);
+              el.dispatchEvent(new Event("scroll"));
+              return el.scrollTop;
+            })()
+            """) { value, error in
+                guard error == nil, let actual = (value as? NSNumber)?.doubleValue else {
+                    action(0, error ?? SnapshotCaptureError.invalidPageMetrics)
+                    return
+                }
+                // Flutter's desktop scroll indicator fades shortly after a
+                // programmatic scroll. Wait for it so it is not baked into
+                // every stitched tile.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    action(actual, nil)
+                }
+            }
+        }
+
+        func restoreAndFinish(_ image: NSImage?, _ error: Error?) {
+            setScroll(info.originalScroll) { _, _ in
+                self.webView.evaluateJavaScript(
+                    "document.getElementById('chromeless-snapshot-scrollbars')?.remove()"
+                ) { _, _ in
+                    completion(image, error)
+                }
+            }
+        }
+
+        func drawRegion(from tile: CGImage, sourceTop: Double, sourceHeight: Double,
+                        outputTop: Double) -> Bool {
+            guard let context = bitmapContext, sourceHeight > 0 else { return sourceHeight <= 0 }
+            let sourceY = max(0, Int(round(sourceTop * pixelsPerCSSPoint)))
+            let requestedHeight = Int(round(sourceHeight * pixelsPerCSSPoint))
+            let sourcePixelHeight = min(requestedHeight, tile.height - sourceY)
+            guard sourcePixelHeight > 0,
+                  let cropped = tile.cropping(to: CGRect(
+                    x: 0, y: sourceY, width: tile.width, height: sourcePixelHeight))
+            else { return false }
+            let outputY = Int(round(outputTop * pixelsPerCSSPoint))
+            context.draw(cropped, in: CGRect(
+                x: 0,
+                y: pixelHeight - outputY - cropped.height,
+                width: cropped.width,
+                height: cropped.height))
+            return true
+        }
+
+        func captureTile(at requested: Double) {
+            setScroll(requested) { actual, scrollError in
+                guard scrollError == nil else {
+                    restoreAndFinish(nil, scrollError)
+                    return
+                }
+                self.webView.takeSnapshot(with: nil) { image, snapshotError in
+                    guard let image,
+                          let tile = image.cgImage(
+                            forProposedRect: nil, context: nil, hints: nil)
+                    else {
+                        restoreAndFinish(nil,
+                            snapshotError ?? SnapshotCaptureError.couldNotCreateImage)
+                        return
+                    }
+
+                    if bitmapContext == nil {
+                        pixelsPerCSSPoint = Double(tile.height) / info.viewportHeight
+                        pixelHeight = Int(ceil(pageHeight * pixelsPerCSSPoint))
+                        let pixelWidth = tile.width
+                        guard pixelWidth > 0, pixelHeight > 0,
+                              pixelWidth <= maximumPixelCount / pixelHeight,
+                              let context = CGContext(
+                                data: nil,
+                                width: pixelWidth,
+                                height: pixelHeight,
+                                bitsPerComponent: 8,
+                                bytesPerRow: pixelWidth * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)
+                                    ?? CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                        else {
+                            restoreAndFinish(nil,
+                                SnapshotCaptureError.imageTooLarge(pixelWidth, pixelHeight))
+                            return
+                        }
+                        bitmapContext = context
+                    }
+
+                    if actual <= 0.5,
+                       !drawRegion(from: tile, sourceTop: 0,
+                                   sourceHeight: info.contentTop, outputTop: 0) {
+                        restoreAndFinish(nil, SnapshotCaptureError.couldNotCreateImage)
+                        return
+                    }
+                    guard drawRegion(
+                        from: tile,
+                        sourceTop: info.contentTop,
+                        sourceHeight: info.contentHeight,
+                        outputTop: info.contentTop + actual)
+                    else {
+                        restoreAndFinish(nil, SnapshotCaptureError.couldNotCreateImage)
+                        return
+                    }
+
+                    if actual >= info.maximumScroll - 0.5 {
+                        guard drawRegion(
+                            from: tile,
+                            sourceTop: bottomFixedTop,
+                            sourceHeight: bottomFixedHeight,
+                            outputTop: info.contentTop + info.contentHeight + info.maximumScroll),
+                              let result = bitmapContext?.makeImage()
+                        else {
+                            restoreAndFinish(nil, SnapshotCaptureError.couldNotCreateImage)
+                            return
+                        }
+                        let finalImage = NSImage(
+                            cgImage: result,
+                            size: NSSize(width: result.width, height: result.height))
+                        restoreAndFinish(finalImage, nil)
+                        return
+                    }
+
+                    let next = min(actual + info.contentHeight, info.maximumScroll)
+                    guard next > actual + 0.5 else {
+                        restoreAndFinish(nil, SnapshotCaptureError.invalidPageMetrics)
+                        return
+                    }
+                    captureTile(at: next)
+                }
+            }
+        }
+
+        captureTile(at: 0)
     }
 
     private func runSnapJob(_ job: SnapJob) {
